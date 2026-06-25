@@ -1,0 +1,1803 @@
+/**
+ * Scrutinizer Relay — Zero-Knowledge Encrypted Report Sharing
+ * 
+ * Cloudflare Worker serving:
+ * - POST /r/           → store encrypted report
+ * - GET  /r/{id}       → serve SPA viewer
+ * - GET  /r/{id}/data  → return ciphertext for client-side decryption
+ * - DELETE /r/{id}     → revoke a shared report
+ * - GET  /view         → file upload viewer (drop zone for JSON exports)
+ * - GET  /             → landing/redirect
+ * 
+ * R2 binding: REPORTS (scrutinizer-reports bucket) — report storage
+ * KV binding: RATELIMIT — rate limiting counters
+ * 
+ * Zero-knowledge: server stores only ciphertext + metadata.
+ * Decryption key lives in URL fragment (#key), never sent to server.
+ */
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Revoke-Token',
+  'Access-Control-Max-Age': '86400',
+};
+
+const MAX_REPORT_SIZE = 10 * 1024 * 1024; // 10MB max ciphertext (R2 supports up to 5GB)
+const VALID_TTL_DAYS = [1, 7, 14, 30];
+const DEFAULT_TTL_DAYS = 7;
+const RATE_LIMIT_WINDOW = 60; // seconds
+const RATE_LIMIT_MAX_CREATE = 10; // max reports per IP per minute
+const RATE_LIMIT_MAX_READ = 60; // max data fetches per IP per minute
+
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_HEADERS });
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    try {
+      // Landing page
+      if (path === '/' || path === '') {
+        return handleLanding();
+      }
+
+      // GET /view — file upload viewer (drop zone for local JSON exports)
+      if (path === '/view' && request.method === 'GET') {
+        return handleFileViewer();
+      }
+
+      // POST /r/ — store encrypted report
+      if (path === '/r/' && request.method === 'POST') {
+        return await handleCreate(request, env);
+      }
+      // Also accept POST /r (no trailing slash)
+      if (path === '/r' && request.method === 'POST') {
+        return await handleCreate(request, env);
+      }
+
+      // GET /r/{id}/data — return ciphertext
+      const dataMatch = path.match(/^\/r\/([a-f0-9]{32})\/data$/);
+      if (dataMatch && request.method === 'GET') {
+        return await handleGetData(dataMatch[1], request, env);
+      }
+
+      // DELETE /r/{id} — revoke report
+      const deleteMatch = path.match(/^\/r\/([a-f0-9]{32})$/);
+      if (deleteMatch && request.method === 'DELETE') {
+        return await handleDelete(deleteMatch[1], request, env);
+      }
+
+      // GET /r/{id} — serve SPA viewer
+      const viewMatch = path.match(/^\/r\/([a-f0-9]{32})$/);
+      if (viewMatch && request.method === 'GET') {
+        return await handleView(viewMatch[1], env);
+      }
+
+      return jsonResponse({ error: 'Not found' }, 404);
+    } catch (err) {
+      console.error('Worker error:', err);
+      return jsonResponse({ error: 'Internal error' }, 500);
+    }
+  }
+};
+
+/**
+ * Landing page — Scrutineer branded, dark theme
+ */
+function handleLanding() {
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scrutinizer Relay — Encrypted Report Sharing</title>
+<meta name="robots" content="noindex, nofollow">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --teal: #15B7A4;
+    --amber: #F0A94E;
+    --bg: #0C2A28;
+    --surface: #0F3330;
+    --border: #1A4A45;
+    --text: #E8F5F3;
+    --muted: #7BA8A2;
+  }
+  body {
+    font-family: 'Inter', -apple-system, sans-serif;
+    background: var(--bg); color: var(--text);
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; padding: 2rem;
+    position: relative;
+  }
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 60px 60px;
+    pointer-events: none;
+  }
+  .container { max-width: 480px; text-align: center; position: relative; z-index: 1; }
+  .lock-icon {
+    width: 64px; height: 64px;
+    margin: 0 auto 1.5rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.75rem;
+  }
+  h1 { font-size: 1.5rem; font-weight: 600; margin-bottom: 0.375rem; letter-spacing: -0.02em; }
+  .tagline {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem; color: var(--amber);
+    letter-spacing: 0.02em; margin-bottom: 1.5rem;
+  }
+  p { font-size: 0.9375rem; line-height: 1.7; color: var(--muted); margin-bottom: 1rem; font-weight: 300; }
+  a { color: var(--teal); text-decoration: none; }
+  a:hover { color: var(--text); }
+  .divider {
+    width: 40px; height: 1px;
+    background: var(--border);
+    margin: 1.5rem auto;
+  }
+  .footer-link {
+    display: inline-block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8125rem;
+    color: var(--teal);
+    padding: 0.625rem 1.25rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    transition: border-color 0.2s, color 0.2s;
+    margin-top: 0.5rem;
+  }
+  .footer-link:hover { border-color: var(--teal); color: var(--text); }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="lock-icon">🔒</div>
+  <h1>Scrutinizer Relay</h1>
+  <div class="tagline">Don't optimize. Scrutinize.</div>
+  <p>Zero-knowledge encrypted report sharing. Reports are encrypted client-side before upload. This server stores only ciphertext it cannot read. Decryption keys never leave your browser.</p>
+  <div class="divider"></div>
+  <a href="https://scrutineer.dev/scrutinizer" class="footer-link">Get Scrutinizer for your WordPress site →</a>
+</div>
+</body>
+</html>`;
+  return new Response(html, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html;charset=utf-8', 'Cache-Control': 'public, max-age=3600' }
+  });
+}
+
+/**
+ * POST /r/ — store encrypted report
+ */
+async function handleCreate(request, env) {
+  // Rate limit
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const rateLimited = await checkRateLimit(env, `create:${ip}`, RATE_LIMIT_MAX_CREATE);
+  if (rateLimited) {
+    return jsonResponse({ error: 'Rate limit exceeded. Try again later.' }, 429);
+  }
+
+  // Parse body
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ error: 'Invalid JSON body' }, 400);
+  }
+
+  // Validate required fields
+  const { ciphertext, iv, ttl_days, has_passphrase, expire_after_reading, compressed } = body;
+
+  if (!ciphertext || typeof ciphertext !== 'string') {
+    return jsonResponse({ error: 'Missing or invalid ciphertext' }, 400);
+  }
+  if (!iv || typeof iv !== 'string') {
+    return jsonResponse({ error: 'Missing or invalid iv' }, 400);
+  }
+
+  // Size check (base64 ciphertext)
+  if (ciphertext.length > MAX_REPORT_SIZE * 1.37) { // base64 overhead ~37%
+    return jsonResponse({ error: `Report too large. Maximum ${MAX_REPORT_SIZE / 1024 / 1024}MB.` }, 413);
+  }
+
+  // TTL
+  const ttl = VALID_TTL_DAYS.includes(ttl_days) ? ttl_days : DEFAULT_TTL_DAYS;
+  const ttlSeconds = ttl * 24 * 60 * 60;
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+
+  // Generate 128-bit capability ID
+  const idBytes = new Uint8Array(16);
+  crypto.getRandomValues(idBytes);
+  const id = Array.from(idBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Generate revocation token
+  const revokeBytes = new Uint8Array(32);
+  crypto.getRandomValues(revokeBytes);
+  const revokeToken = Array.from(revokeBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+
+  // Store in R2 — single object with metadata
+  const metadata = {
+    iv,
+    has_passphrase: !!has_passphrase,
+    expire_after_reading: !!expire_after_reading,
+    compressed: !!compressed,
+    revoke_token: revokeToken,
+    created_at: new Date().toISOString(),
+    expires_at: expiresAt,
+  };
+
+  await env.REPORTS.put(`report:${id}`, ciphertext, {
+    customMetadata: metadata,
+  });
+
+  return jsonResponse({
+    id,
+    expires_at: expiresAt,
+    ttl_days: ttl,
+    revoke_token: revokeToken,
+    url: `https://scrutinizer.dev/r/${id}`,
+  }, 201);
+}
+
+/**
+ * GET /r/{id}/data — return ciphertext for client-side decryption
+ */
+async function handleGetData(id, request, env) {
+  // Rate limit reads
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const rateLimited = await checkRateLimit(env, `read:${ip}`, RATE_LIMIT_MAX_READ);
+  if (rateLimited) {
+    return jsonResponse({ error: 'Rate limit exceeded. Try again later.' }, 429);
+  }
+
+  // Fetch from R2
+  const obj = await env.REPORTS.get(`report:${id}`);
+  if (!obj) {
+    return jsonResponse({ error: 'Report not found or expired.' }, 404);
+  }
+
+  const meta = obj.customMetadata;
+
+  // Check expiry (R2 doesn't have native TTL)
+  if (meta.expires_at && new Date(meta.expires_at) < new Date()) {
+    await env.REPORTS.delete(`report:${id}`);
+    return jsonResponse({ error: 'Report not found or expired.' }, 404);
+  }
+
+  // Read ciphertext
+  const ciphertext = await obj.text();
+
+  // Build response
+  const response = {
+    ciphertext,
+    iv: meta.iv,
+    has_passphrase: meta.has_passphrase === 'true' || meta.has_passphrase === true,
+    compressed: meta.compressed === 'true' || meta.compressed === true,
+    created_at: meta.created_at,
+    expires_at: meta.expires_at,
+  };
+
+  // Expire after reading — delete after serving
+  if (meta.expire_after_reading === 'true' || meta.expire_after_reading === true) {
+    await env.REPORTS.delete(`report:${id}`);
+  }
+
+  return jsonResponse(response, 200, {
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+  });
+}
+
+/**
+ * DELETE /r/{id} — revoke a shared report
+ */
+async function handleDelete(id, request, env) {
+  const revokeToken = request.headers.get('X-Revoke-Token');
+  if (!revokeToken) {
+    return jsonResponse({ error: 'Missing X-Revoke-Token header' }, 401);
+  }
+
+  const obj = await env.REPORTS.head(`report:${id}`);
+  if (!obj) {
+    return jsonResponse({ error: 'Report not found or already expired.' }, 404);
+  }
+
+  const meta = obj.customMetadata;
+  if (meta.revoke_token !== revokeToken) {
+    return jsonResponse({ error: 'Invalid revocation token.' }, 403);
+  }
+
+  await env.REPORTS.delete(`report:${id}`);
+
+  return jsonResponse({ success: true, message: 'Report revoked.' }, 200);
+}
+
+/**
+ * GET /r/{id} — serve the SPA viewer
+ */
+async function handleView(id, env) {
+  // Check if report exists via R2 head (no data transfer)
+  const obj = await env.REPORTS.head(`report:${id}`);
+  let exists = !!obj;
+
+  // Check expiry
+  if (exists && obj.customMetadata.expires_at && new Date(obj.customMetadata.expires_at) < new Date()) {
+    await env.REPORTS.delete(`report:${id}`);
+    exists = false;
+  }
+
+  const html = generateViewerHTML(id, exists);
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html;charset=utf-8',
+      'Cache-Control': 'no-store',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      ...CORS_HEADERS,
+    }
+  });
+}
+
+/**
+ * Rate limiting via KV (sliding window approximation)
+ */
+async function checkRateLimit(env, key, max) {
+  const rlKey = `ratelimit:${key}`;
+  const now = Math.floor(Date.now() / 1000);
+  const windowKey = `${rlKey}:${Math.floor(now / RATE_LIMIT_WINDOW)}`;
+
+  const current = parseInt(await env.RATELIMIT.get(windowKey) || '0', 10);
+  if (current >= max) {
+    return true; // rate limited
+  }
+
+  await env.RATELIMIT.put(windowKey, String(current + 1), { expirationTtl: RATE_LIMIT_WINDOW * 2 });
+  return false;
+}
+
+/**
+ * JSON response helper
+ */
+function jsonResponse(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...CORS_HEADERS,
+      ...extraHeaders,
+    }
+  });
+}
+
+/**
+ * Generate the full SPA viewer HTML
+ */
+function generateViewerHTML(reportId, reportExists) {
+  return VIEWER_HTML.replace('{{REPORT_ID}}', reportId)
+    .replace('{{REPORT_EXISTS}}', reportExists ? 'true' : 'false')
+    .replace('{{MODE}}', 'relay');
+}
+
+/**
+ * GET /view — file upload viewer (drop zone for local JSON exports)
+ */
+function handleFileViewer() {
+  const html = VIEWER_HTML.replace('{{REPORT_ID}}', '')
+    .replace('{{REPORT_EXISTS}}', 'false')
+    .replace('{{MODE}}', 'file');
+
+  return new Response(html, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html;charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      ...CORS_HEADERS,
+    }
+  });
+}
+
+// The SPA viewer HTML is defined below — inlined in the worker for single-file deploy
+const VIEWER_HTML = `<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scrutinizer Report</title>
+<meta name="robots" content="noindex, nofollow">
+<meta name="report-id" content="{{REPORT_ID}}">
+<meta name="report-exists" content="{{REPORT_EXISTS}}">
+<meta name="viewer-mode" content="{{MODE}}">
+<style>
+:root {
+  --bg: #0a0a0a;
+  --bg-card: #141414;
+  --bg-card-hover: #1a1a1a;
+  --border: #2a2a2a;
+  --text: #e0e0e0;
+  --text-muted: #888;
+  --text-dim: #666;
+  --accent: #60a5fa;
+  --accent-hover: #93c5fd;
+  --green: #4ade80;
+  --red: #f87171;
+  --amber: #fbbf24;
+  --orange: #fb923c;
+  --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+
+  /* Source colors — match plugin */
+  --src-plugin: #60a5fa;
+  --src-theme: #c084fc;
+  --src-core: #94a3b8;
+  --src-mu-plugin: #fb923c;
+  --src-drop-in: #4ade80;
+  --src-unknown: #fbbf24;
+  --src-unattributed: #475569;
+}
+
+html[data-theme="light"] {
+  --bg: #f8f9fa;
+  --bg-card: #ffffff;
+  --bg-card-hover: #f1f3f5;
+  --border: #dee2e6;
+  --text: #1a1a1a;
+  --text-muted: #6c757d;
+  --text-dim: #adb5bd;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: var(--sans);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100vh;
+}
+
+/* Layout */
+.viewer-header {
+  border-bottom: 1px solid var(--border);
+  padding: 1rem 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 100;
+}
+.viewer-header h1 {
+  font-size: 1rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.viewer-header .wordmark {
+  font-family: var(--mono);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #15B7A4;
+}
+.viewer-header .controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+/* Drop zone for file upload */
+.drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 4rem 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  max-width: 480px;
+  margin: 0 auto;
+}
+.drop-zone:hover,
+.drop-zone.dragover {
+  border-color: var(--accent);
+  background: rgba(96, 165, 250, 0.05);
+}
+.drop-zone .icon {
+  font-size: 3rem;
+  margin-bottom: 1rem;
+}
+.drop-zone p {
+  color: var(--text-muted);
+  margin: 0.5rem 0;
+}
+.drop-zone .hint {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.drop-zone input[type="file"] {
+  display: none;
+}
+.theme-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.35rem 0.6rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+.theme-toggle:hover { border-color: var(--text-muted); }
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+/* Guidance banner */
+.guidance {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+  position: relative;
+}
+.guidance h2 { font-size: 1rem; margin-bottom: 0.5rem; }
+.guidance p { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.4rem; }
+.guidance .dismiss {
+  position: absolute;
+  top: 0.75rem;
+  right: 1rem;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 1.1rem;
+}
+.guidance ul { list-style: none; margin-top: 0.5rem; }
+.guidance li { font-size: 0.9rem; color: var(--text-muted); padding: 0.15rem 0; }
+.guidance li strong { color: var(--text); }
+
+/* States */
+.state-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  text-align: center;
+  gap: 1rem;
+}
+.state-container .icon { font-size: 3rem; }
+.state-container h2 { font-size: 1.25rem; font-weight: 600; }
+.state-container p { font-size: 0.95rem; color: var(--text-muted); max-width: 400px; }
+
+/* Passphrase input */
+.passphrase-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+.passphrase-form input {
+  font-family: var(--mono);
+  font-size: 1rem;
+  padding: 0.6rem 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  width: 280px;
+  text-align: center;
+}
+.passphrase-form input:focus { outline: none; border-color: var(--accent); }
+.passphrase-form button, .btn {
+  font-family: var(--sans);
+  font-size: 0.9rem;
+  padding: 0.5rem 1.25rem;
+  background: var(--accent);
+  color: #000;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 500;
+}
+.passphrase-form button:hover, .btn:hover { background: var(--accent-hover); }
+.error-text { color: var(--red); font-size: 0.85rem; }
+
+/* Loading spinner */
+.spinner {
+  width: 32px; height: 32px;
+  border: 3px solid var(--border);
+  border-top: 3px solid var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Metric cards */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.metric-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+.metric-card .label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.25rem;
+}
+.metric-card .value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+.metric-card .sub {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-top: 0.15rem;
+}
+
+/* Request info */
+.request-info {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.5rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  align-items: center;
+}
+.request-info .route {
+  font-family: var(--mono);
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+.request-info .route-label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.request-info .meta-item {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+.request-info .meta-item strong { color: var(--text); }
+
+/* Tab bar */
+.tab-bar {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.5rem;
+  overflow-x: auto;
+}
+.tab-bar button {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  padding: 0.6rem 1.25rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab-bar button:hover { color: var(--text); }
+.tab-bar button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+/* Breakdown bar */
+.breakdown-bar {
+  display: flex;
+  height: 32px;
+  border-radius: 6px;
+  overflow: hidden;
+  margin-bottom: 1rem;
+  border: 1px solid var(--border);
+}
+.breakdown-segment {
+  min-width: 2px;
+  position: relative;
+  transition: opacity 0.15s;
+}
+.breakdown-segment:hover { opacity: 0.85; }
+.breakdown-segment .tooltip {
+  display: none;
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #000;
+  color: #fff;
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  z-index: 10;
+  margin-bottom: 4px;
+}
+.breakdown-segment:hover .tooltip { display: block; }
+
+/* Tables */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+.data-table th {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.data-table td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+.data-table tr:hover td { background: var(--bg-card-hover); }
+.data-table .mono { font-family: var(--mono); font-size: 0.8rem; }
+.data-table .num { text-align: right; font-family: var(--mono); }
+.data-table .source-badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+.data-table .weight-bar {
+  height: 4px;
+  border-radius: 2px;
+  margin-top: 0.25rem;
+  min-width: 2px;
+}
+.data-table .slow { color: var(--red); }
+
+/* Timeline */
+.timeline-container {
+  position: relative;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  overflow-x: auto;
+}
+.timeline-bar-area {
+  position: relative;
+  height: 48px;
+  margin-bottom: 1rem;
+}
+.timeline-segment {
+  position: absolute;
+  height: 28px;
+  top: 10px;
+  border-radius: 3px;
+  min-width: 1px;
+  cursor: default;
+}
+.timeline-segment:hover { opacity: 0.85; }
+.timeline-segment .tooltip {
+  display: none;
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  background: #000;
+  color: #fff;
+  padding: 0.3rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  z-index: 10;
+  margin-bottom: 4px;
+  pointer-events: none;
+}
+.timeline-segment:hover .tooltip { display: block; }
+.timeline-milestone {
+  position: absolute;
+  top: 0;
+  width: 1px;
+  height: 100%;
+  opacity: 0.6;
+}
+.timeline-milestone .dot {
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  border: 1px solid var(--bg-card);
+}
+.timeline-milestone .label {
+  position: absolute;
+  top: -22px;
+  left: 4px;
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+.timeline-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  margin-top: 0.25rem;
+}
+
+/* Legend */
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 1rem;
+  font-size: 0.8rem;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--text-muted);
+}
+.legend-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+/* Diagnostics */
+.diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 1rem;
+}
+.diag-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+.diag-section h3 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.diag-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0;
+  font-size: 0.85rem;
+}
+.diag-row .diag-key { color: var(--text-muted); }
+.diag-row .diag-val { font-family: var(--mono); font-size: 0.8rem; }
+
+/* Trace tree */
+.trace-tree { font-size: 0.85rem; }
+.trace-phase {
+  margin-bottom: 0.5rem;
+}
+.trace-phase > summary {
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-weight: 500;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.trace-phase > summary::before {
+  content: '▸';
+  font-size: 0.7rem;
+  transition: transform 0.15s;
+}
+.trace-phase[open] > summary::before { content: '▾'; }
+.trace-phase > summary .phase-time {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.trace-callbacks {
+  padding: 0.25rem 0 0.25rem 1.5rem;
+}
+.trace-callback {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8rem;
+  border-bottom: 1px solid var(--border);
+}
+.trace-callback:last-child { border-bottom: none; }
+.trace-callback .cb-name {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.trace-callback .cb-time {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.trace-callback .cb-source {
+  font-size: 0.7rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+/* Security footer */
+.security-footer {
+  margin-top: 3rem;
+  padding: 1rem 0;
+  border-top: 1px solid var(--border);
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+.security-footer a { color: var(--accent); text-decoration: none; }
+
+/* Print */
+@media print {
+  .viewer-header, .theme-toggle, .guidance .dismiss { display: none; }
+  body { background: #fff; color: #000; }
+  .tab-panel { display: block !important; page-break-inside: avoid; margin-bottom: 2rem; }
+  .tab-bar { display: none; }
+}
+
+/* Responsive */
+@media (max-width: 640px) {
+  .metrics { grid-template-columns: 1fr 1fr; }
+  .request-info { flex-direction: column; gap: 0.5rem; }
+  .container { padding: 1rem; }
+}
+</style>
+</head>
+<body>
+
+<header class="viewer-header">
+  <h1><a href="https://scrutineer.dev/scrutinizer" style="color:inherit;text-decoration:none"><span class="wordmark">Scrutinizer</span></a> Report</h1>
+  <div class="controls">
+    <button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme">◐</button>
+  </div>
+</header>
+
+<div class="container">
+  <div id="app"></div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  const REPORT_ID = document.querySelector('meta[name="report-id"]').content;
+  const REPORT_EXISTS = document.querySelector('meta[name="report-exists"]').content === 'true';
+  const VIEWER_MODE = document.querySelector('meta[name="viewer-mode"]').content;
+  const app = document.getElementById('app');
+
+  const SOURCE_COLORS = {
+    plugin: '#60a5fa',
+    theme: '#c084fc',
+    core: '#94a3b8',
+    'mu-plugin': '#fb923c',
+    'drop-in': '#4ade80',
+    unknown: '#fbbf24',
+    unattributed: '#475569',
+  };
+
+  // Theme
+  function toggleTheme() {
+    const html = document.documentElement;
+    const next = html.dataset.theme === 'dark' ? 'light' : 'dark';
+    html.dataset.theme = next;
+    localStorage.setItem('scrutinizer-theme', next);
+  }
+  window.toggleTheme = toggleTheme;
+  const savedTheme = localStorage.getItem('scrutinizer-theme');
+  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+
+  // Entry point
+  async function init() {
+    // File upload mode — show drop zone
+    if (VIEWER_MODE === 'file') {
+      showFileUpload();
+      return;
+    }
+
+    // Relay mode — need fragment key
+    const fragment = window.location.hash.slice(1);
+    if (!fragment) {
+      showError('🔗', 'Incomplete link',
+        'This report link is incomplete. Make sure the full URL was copied, including everything after the # symbol.');
+      return;
+    }
+
+    // Report doesn't exist?
+    if (!REPORT_EXISTS) {
+      showError('⏱️', 'Report expired or revoked',
+        'This report has expired or been revoked by the owner.');
+      return;
+    }
+
+    // Show loading
+    showLoading('Fetching encrypted report…');
+
+    try {
+      // Fetch ciphertext
+      const resp = await fetch('/r/' + REPORT_ID + '/data');
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          showError('⏱️', 'Report expired or revoked',
+            'This report has expired or been revoked by the owner.');
+        } else if (resp.status === 429) {
+          showError('🚦', 'Too many requests',
+            'Please wait a moment and try again.');
+        } else {
+          showError('❌', 'Failed to load report',
+            'Something went wrong fetching this report.');
+        }
+        return;
+      }
+
+      const data = await resp.json();
+
+      // Passphrase protected?
+      if (data.has_passphrase) {
+        showPassphrasePrompt(data, fragment);
+        return;
+      }
+
+      // Decrypt (and decompress if needed)
+      showLoading('Decrypting report…');
+      const report = await decryptReport(data.ciphertext, data.iv, fragment, null, data.compressed);
+      renderReport(report, data);
+
+    } catch (err) {
+      console.error('Init error:', err);
+      showError('🔓', 'Decryption failed',
+        'This report could not be decrypted. The link may be damaged or the key is incorrect.');
+    }
+  }
+
+  // File upload drop zone
+  function showFileUpload() {
+    var html = '<div class="drop-zone" id="drop-zone">';
+    html += '<div class="icon">📂</div>';
+    html += '<p>Drop a Scrutinizer JSON export or click to browse</p>';
+    html += '<p class="hint">Exported via WP-CLI or the plugin dashboard. No data leaves your browser.</p>';
+    html += '<input type="file" id="file-input" accept=".json,application/json">';
+    html += '</div>';
+    app.innerHTML = html;
+
+    var zone = document.getElementById('drop-zone');
+    var input = document.getElementById('file-input');
+
+    zone.addEventListener('click', function() { input.click(); });
+
+    zone.addEventListener('dragover', function(e) {
+      e.preventDefault();
+      zone.classList.add('dragover');
+    });
+    zone.addEventListener('dragleave', function() {
+      zone.classList.remove('dragover');
+    });
+    zone.addEventListener('drop', function(e) {
+      e.preventDefault();
+      zone.classList.remove('dragover');
+      if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+    });
+    input.addEventListener('change', function() {
+      if (input.files.length) loadFile(input.files[0]);
+    });
+  }
+
+  function loadFile(file) {
+    if (!file.name.endsWith('.json') && file.type !== 'application/json') {
+      showError('⚠️', 'Unsupported file', 'Please select a JSON file exported from Scrutinizer.');
+      return;
+    }
+
+    showLoading('Reading file…');
+
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        var report = JSON.parse(e.target.result);
+        // Validate it looks like a Scrutinizer export
+        if (!report.summary && !report.profile_data) {
+          showError('⚠️', 'Invalid format', 'This file does not appear to be a Scrutinizer export.');
+          return;
+        }
+        // If it has profile_data wrapper, unwrap it
+        var data = report.profile_data ? report.profile_data : report;
+        renderReport(data, { created_at: report._scrutinizer ? report._scrutinizer.exported_at : null });
+      } catch (err) {
+        console.error('Parse error:', err);
+        showError('⚠️', 'Parse error', 'Could not parse this file. Make sure it is valid JSON.');
+      }
+    };
+    reader.onerror = function() {
+      showError('❌', 'Read error', 'Could not read this file.');
+    };
+    reader.readAsText(file);
+  }
+
+  // Decrypt
+  async function decryptReport(ciphertextB64, ivB64, keyB64, passphrase, compressed) {
+    let keyBytes = base64urlDecode(keyB64);
+
+    // If passphrase, unwrap the data key first
+    if (passphrase) {
+      // The keyB64 in fragment is the wrapped key when passphrase is used
+      // We need to derive the wrapping key from passphrase and unwrap
+      const enc = new TextEncoder();
+      const passphraseKey = await crypto.subtle.importKey(
+        'raw', enc.encode(passphrase), 'PBKDF2', false, ['deriveBits', 'deriveKey']
+      );
+      const salt = base64urlDecode(ivB64); // reuse IV as PBKDF2 salt for simplicity
+      const wrappingKey = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+        passphraseKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['decrypt']
+      );
+      // Fragment contains the encrypted data key
+      const wrappedKeyIv = keyBytes.slice(0, 12);
+      const wrappedKeyData = keyBytes.slice(12);
+      const unwrappedKey = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: wrappedKeyIv },
+        wrappingKey,
+        wrappedKeyData
+      );
+      keyBytes = new Uint8Array(unwrappedKey);
+    }
+
+    const key = await crypto.subtle.importKey(
+      'raw', keyBytes, { name: 'AES-GCM' }, false, ['decrypt']
+    );
+
+    const iv = base64urlDecode(ivB64);
+    const ciphertext = base64urlDecode(ciphertextB64);
+
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      ciphertext
+    );
+
+    // Decompress if the payload was gzipped before encryption
+    let jsonBytes;
+    if (compressed) {
+      const ds = new DecompressionStream('gzip');
+      const writer = ds.writable.getWriter();
+      writer.write(new Uint8Array(plaintext));
+      writer.close();
+      const reader = ds.readable.getReader();
+      const chunks = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+      const totalLen = chunks.reduce(function(a, c) { return a + c.length; }, 0);
+      jsonBytes = new Uint8Array(totalLen);
+      let offset = 0;
+      for (let i = 0; i < chunks.length; i++) {
+        jsonBytes.set(chunks[i], offset);
+        offset += chunks[i].length;
+      }
+    } else {
+      jsonBytes = new Uint8Array(plaintext);
+    }
+
+    const decoder = new TextDecoder();
+    return JSON.parse(decoder.decode(jsonBytes));
+  }
+
+  // Base64url decode
+  function base64urlDecode(str) {
+    str = str.replace(/-/g, '+').replace(/_/g, '/');
+    while (str.length % 4) str += '=';
+    const binary = atob(str);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  // UI States
+  function showLoading(msg) {
+    app.innerHTML = '<div class="state-container"><div class="spinner"></div><p>' + escHtml(msg) + '</p></div>';
+  }
+
+  function showError(icon, title, msg) {
+    app.innerHTML = '<div class="state-container"><div class="icon">' + icon + '</div>' +
+      '<h2>' + escHtml(title) + '</h2><p>' + escHtml(msg) + '</p></div>';
+  }
+
+  function showPassphrasePrompt(data, fragment) {
+    app.innerHTML = '<div class="state-container"><div class="icon">🔐</div>' +
+      '<h2>Passphrase required</h2>' +
+      '<p>This report is protected with a passphrase.</p>' +
+      '<div class="passphrase-form">' +
+      '<input type="password" id="passphrase-input" placeholder="Enter passphrase" autofocus>' +
+      '<button onclick="window._attemptDecrypt()">Decrypt</button>' +
+      '<div id="passphrase-error" class="error-text"></div>' +
+      '</div></div>';
+
+    const input = document.getElementById('passphrase-input');
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') window._attemptDecrypt(); });
+
+    let attempts = 0;
+    window._attemptDecrypt = async function() {
+      const passphrase = input.value;
+      if (!passphrase) return;
+
+      attempts++;
+      if (attempts > 5) {
+        document.getElementById('passphrase-error').textContent = 'Too many attempts.';
+        return;
+      }
+
+      try {
+        showLoading('Decrypting…');
+        const report = await decryptReport(data.ciphertext, data.iv, fragment, passphrase, data.compressed);
+        renderReport(report, data);
+      } catch {
+        showPassphrasePrompt(data, fragment);
+        document.getElementById('passphrase-error').textContent = 'Incorrect passphrase. Please try again.';
+      }
+    };
+  }
+
+  // Render the full report
+  function renderReport(report, meta) {
+    const guidanceDismissed = localStorage.getItem('scrutinizer-guidance-dismissed');
+
+    let html = '';
+
+    // Guidance banner
+    if (!guidanceDismissed) {
+      html += '<div class="guidance" id="guidance">' +
+        '<button class="dismiss" id="dismiss-guidance">✕</button>' +
+        '<h2>📊 How to read this report</h2>' +
+        '<p>This performance report was shared with you by a WordPress site owner. It shows server-side profiling data — where time goes during a page request.</p>' +
+        '<ul>' +
+        '<li><strong>Timeline</strong> — when things happen during request processing</li>' +
+        '<li><strong>Breakdown</strong> — which plugins and theme use the most server time</li>' +
+        '<li><strong>Sources</strong> — detailed attribution with callback counts</li>' +
+        '<li><strong>Queries</strong> — database calls, sorted by duration</li>' +
+        '</ul>' +
+        '<p style="margin-top:0.75rem;">\ud83d\udd12 Do not share this link with anyone else \u2014 it contains the key to view this report.</p>' +
+        '</div>';
+    }
+
+    // Extract data
+    const summary = report.summary || {};
+    const request = report.request || {};
+    const sources = report.sources || [];
+    const queries = report.queries || [];
+    const timeline = report.timeline || [];
+    const milestones = report.phase_markers || [];
+    const diagnostics = report.diagnostics || null;
+    const trace = report.trace || [];
+    const httpCalls = report.http_calls || [];
+    const autoloadedOptions = report.autoloaded_options || null;
+    const enqueuedAssets = report.enqueued_assets || null;
+
+    const durationMs = (summary.duration_ns || 0) / 1e6;
+    const memoryMb = (summary.peak_memory_bytes || 0) / (1024 * 1024);
+    const queryCount = summary.query_count || 0;
+    const callbackCount = summary.total_callbacks || 0;
+
+    // Request info
+    html += '<div class="request-info">';
+    if (request.label) {
+      html += '<div><div class="route-label">' + escHtml(request.label) + '</div>' +
+        '<div class="route">' + escHtml(request.method || 'GET') + ' ' + escHtml(request.route_key || request.url || '/') + '</div></div>';
+    } else {
+      html += '<div class="route">' + escHtml(request.method || 'GET') + ' ' + escHtml(request.route_key || request.url || '/') + '</div>';
+    }
+    if (request.role) html += '<div class="meta-item"><strong>Role:</strong> ' + escHtml(request.role) + '</div>';
+    if (request.status) html += '<div class="meta-item"><strong>Status:</strong> ' + request.status + '</div>';
+    if (report.captured_at) html += '<div class="meta-item"><strong>Captured:</strong> ' + escHtml(formatDate(report.captured_at)) + '</div>';
+    html += '<div class="meta-item" style="color:var(--text-dim)">Expires: ' + escHtml(formatDate(meta.expires_at)) + '</div>';
+    html += '</div>';
+
+    // Metric cards
+    html += '<div class="metrics">';
+    html += metricCard('Server Request Duration', formatMs(durationMs), '');
+    html += metricCard('Peak Memory', memoryMb.toFixed(1) + ' MB', '');
+    html += metricCard('DB Queries', queryCount.toString(), queries.length ? formatMs(queries.reduce((s, q) => s + (q.time_ms || 0), 0)) + ' total' : '');
+    html += metricCard('Callbacks', callbackCount.toString(), sources.length + ' sources');
+    if (httpCalls.length) {
+      const httpTotalMs = httpCalls.reduce((s, h) => s + (h.duration_ms || 0), 0);
+      html += metricCard('HTTP Calls', httpCalls.length.toString(), formatMs(httpTotalMs) + ' total');
+    }
+    html += '</div>';
+
+    // Tab bar
+    const tabs = [];
+    if (timeline.length || milestones.length) tabs.push({ id: 'timeline', label: 'Timeline' });
+    if (sources.length) tabs.push({ id: 'breakdown', label: 'Breakdown' });
+    if (sources.length) tabs.push({ id: 'sources', label: 'Sources' });
+    if (queries.length) tabs.push({ id: 'queries', label: 'Queries' });
+    if (trace.length) tabs.push({ id: 'trace', label: 'Trace' });
+    if (httpCalls.length) tabs.push({ id: 'http_calls', label: 'HTTP Calls' });
+    if (autoloadedOptions && autoloadedOptions.total_size) tabs.push({ id: 'options', label: 'Options' });
+    if (enqueuedAssets && ((enqueuedAssets.scripts || []).length || (enqueuedAssets.styles || []).length)) tabs.push({ id: 'assets', label: 'Assets' });
+    if (diagnostics) tabs.push({ id: 'diagnostics', label: 'Diagnostics' });
+
+    html += '<div class="tab-bar">';
+    tabs.forEach((t, i) => {
+      html += '<button data-tab="' + t.id + '" class="' + (i === 0 ? 'active' : '') + '">' + t.label + '</button>';
+    });
+    html += '</div>';
+
+    // Tab panels
+    // Timeline
+    if (timeline.length || milestones.length) {
+      html += '<div class="tab-panel' + (tabs[0]?.id === 'timeline' ? ' active' : '') + '" id="panel-timeline">';
+      html += renderTimeline(timeline, milestones, durationMs);
+      html += '</div>';
+    }
+
+    // Breakdown
+    if (sources.length) {
+      html += '<div class="tab-panel' + (tabs[0]?.id === 'breakdown' ? ' active' : '') + '" id="panel-breakdown">';
+      html += '<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">Where server request duration is spent, broken down by source.</p>';
+      html += renderBreakdownBar(sources, durationMs);
+      html += renderLegend(sources);
+      html += '</div>';
+    }
+
+    // Sources table
+    if (sources.length) {
+      html += '<div class="tab-panel" id="panel-sources">';
+      html += '<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">Each source\\\'s contribution to server request duration, with callback counts.</p>';
+      html += renderSourcesTable(sources, durationMs);
+      html += '</div>';
+    }
+
+    // Queries table
+    if (queries.length) {
+      html += '<div class="tab-panel" id="panel-queries">';
+      html += renderQueriesTable(queries);
+      html += '</div>';
+    }
+
+    // Trace
+    if (trace.length) {
+      html += '<div class="tab-panel" id="panel-trace">';
+      html += renderTrace(trace);
+      html += '</div>';
+    }
+
+    // HTTP Calls
+    if (httpCalls.length) {
+      html += '<div class="tab-panel" id="panel-http_calls">';
+      html += renderHttpCalls(httpCalls);
+      html += '</div>';
+    }
+
+    // Autoloaded Options
+    if (autoloadedOptions && autoloadedOptions.total_size) {
+      html += '<div class="tab-panel" id="panel-options">';
+      html += renderAutoloadedOptions(autoloadedOptions);
+      html += '</div>';
+    }
+
+    // Enqueued Assets
+    if (enqueuedAssets && ((enqueuedAssets.scripts || []).length || (enqueuedAssets.styles || []).length)) {
+      html += '<div class="tab-panel" id="panel-assets">';
+      html += renderEnqueuedAssets(enqueuedAssets);
+      html += '</div>';
+    }
+
+    // Diagnostics
+    if (diagnostics) {
+      html += '<div class="tab-panel" id="panel-diagnostics">';
+      html += renderDiagnostics(diagnostics);
+      html += '</div>';
+    }
+
+    // Security footer
+    html += '<div class="security-footer">';
+    html += '🔒 This report was decrypted entirely in your browser. The server never sees the contents.<br>';
+    html += '<a href="https://scrutineer.dev/scrutinizer">Scrutinizer</a> — WordPress Performance Profiler';
+    html += '</div>';
+
+    app.innerHTML = html;
+
+    // Guidance dismiss button (avoids inline onclick quoting issues in template literal).
+    var dismissBtn = document.getElementById('dismiss-guidance');
+    if (dismissBtn) {
+      dismissBtn.addEventListener('click', function() {
+        var g = document.getElementById('guidance');
+        if (g) g.remove();
+        localStorage.setItem('scrutinizer-guidance-dismissed', '1');
+      });
+    }
+
+    // Tab switching via delegation (avoids inline onclick quoting issues).
+    var tabBar = document.querySelector('.tab-bar');
+    if (tabBar) {
+      tabBar.addEventListener('click', function(e) {
+        var btn = e.target.closest('[data-tab]');
+        if (!btn) return;
+        switchTab(btn.dataset.tab);
+      });
+    }
+  }
+
+  // Tab switching
+  window.switchTab = function(tabId) {
+    document.querySelectorAll('.tab-bar button').forEach(b => b.classList.toggle('active', b.dataset.tab === tabId));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + tabId));
+  };
+
+  // Render helpers
+  function metricCard(label, value, sub) {
+    return '<div class="metric-card"><div class="label">' + escHtml(label) + '</div>' +
+      '<div class="value">' + escHtml(value) + '</div>' +
+      (sub ? '<div class="sub">' + escHtml(sub) + '</div>' : '') + '</div>';
+  }
+
+  function renderTimeline(timeline, milestones, totalMs) {
+    if (!totalMs) return '<p style="color:var(--text-muted)">No timeline data.</p>';
+
+    let html = '<div class="timeline-container"><div class="timeline-bar-area">';
+
+    // Segments
+    timeline.forEach(item => {
+      const left = ((item.offset_ms || 0) / totalMs * 100).toFixed(3);
+      const width = Math.max(0.1, (item.duration_ms || 0) / totalMs * 100).toFixed(3);
+      const color = SOURCE_COLORS[item.source_type] || SOURCE_COLORS.unknown;
+      html += '<div class="timeline-segment" style="left:' + left + '%;width:' + width + '%;background:' + color + '">' +
+        '<div class="tooltip">' + escHtml(item.callback || item.source || '') + ' · ' + formatMs(item.duration_ms || 0) + '</div></div>';
+    });
+
+    // Milestones
+    milestones.forEach((m, i) => {
+      const left = ((m.offset_ms || 0) / totalMs * 100).toFixed(3);
+      const tierOffset = (i % 3) * 18;
+      html += '<div class="timeline-milestone" style="left:' + left + '%;background:var(--border)">' +
+        '<div class="dot"></div>' +
+        '<div class="label" style="top:' + (-22 - tierOffset) + 'px">' + escHtml(m.label || m.hook || '') + '</div></div>';
+    });
+
+    html += '</div>'; // timeline-bar-area
+
+    // Axis
+    html += '<div class="timeline-axis"><span>0 ms</span><span>' + formatMs(totalMs) + '</span></div>';
+    html += '</div>'; // timeline-container
+
+    return html;
+  }
+
+  function renderBreakdownBar(sources, totalMs) {
+    if (!totalMs) return '';
+    const sorted = [...sources].sort((a, b) => (b.exclusive_ms || 0) - (a.exclusive_ms || 0));
+
+    let html = '<div class="breakdown-bar">';
+    sorted.forEach(src => {
+      const pct = ((src.exclusive_ms || 0) / totalMs * 100).toFixed(2);
+      if (parseFloat(pct) < 0.1) return;
+      const color = SOURCE_COLORS[src.type] || SOURCE_COLORS.unknown;
+      html += '<div class="breakdown-segment" style="width:' + pct + '%;background:' + color + '">' +
+        '<div class="tooltip">' + escHtml(src.source || src.name) + ': ' + formatMs(src.exclusive_ms || 0) + ' (' + pct + '%)</div></div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function renderLegend(sources) {
+    const sorted = [...sources].sort((a, b) => (b.exclusive_ms || 0) - (a.exclusive_ms || 0));
+    let html = '<div class="legend">';
+    sorted.forEach(src => {
+      const color = SOURCE_COLORS[src.type] || SOURCE_COLORS.unknown;
+      html += '<div class="legend-item"><div class="legend-swatch" style="background:' + color + '"></div>' +
+        escHtml(src.source || src.name) + '</div>';
+    });
+    html += '</div>';
+    return html;
+  }
+
+  function renderSourcesTable(sources, totalMs) {
+    const sorted = [...sources].sort((a, b) => (b.exclusive_ms || 0) - (a.exclusive_ms || 0));
+
+    let html = '<table class="data-table"><thead><tr>' +
+      '<th>Source</th><th>Type</th><th class="num">Exclusive</th><th class="num">%</th>' +
+      '<th class="num">Inclusive</th><th class="num">Callbacks</th></tr></thead><tbody>';
+
+    sorted.forEach(src => {
+      const color = SOURCE_COLORS[src.type] || SOURCE_COLORS.unknown;
+      const pct = totalMs ? ((src.exclusive_ms || 0) / totalMs * 100).toFixed(1) : '—';
+      html += '<tr><td>' +
+        '<span class="source-badge" style="background:' + color + '22;color:' + color + '">' + escHtml(src.source || src.name) + '</span>' +
+        '<div class="weight-bar" style="width:' + pct + '%;background:' + color + '"></div>' +
+        '</td>' +
+        '<td>' + escHtml(src.type || '') + '</td>' +
+        '<td class="num">' + formatMs(src.exclusive_ms || 0) + '</td>' +
+        '<td class="num">' + pct + '%</td>' +
+        '<td class="num">' + formatMs(src.inclusive_ms || 0) + '</td>' +
+        '<td class="num">' + (src.callback_count || 0) + '</td></tr>';
+    });
+
+    html += '</tbody></table>';
+    return html;
+  }
+
+  function renderQueriesTable(queries) {
+    const sorted = [...queries].sort((a, b) => (b.time_ms || 0) - (a.time_ms || 0));
+    const top = sorted.slice(0, 100);
+
+    let html = '<table class="data-table"><thead><tr>' +
+      '<th>Query</th><th class="num">Time</th><th>Source</th></tr></thead><tbody>';
+
+    top.forEach(q => {
+      const slow = (q.time_ms || 0) > 10 ? ' slow' : '';
+      const color = SOURCE_COLORS[q.source_type] || SOURCE_COLORS.unknown;
+      html += '<tr><td class="mono" style="max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escAttr(q.sql || '') + '">' +
+        escHtml(q.sql || '') + '</td>' +
+        '<td class="num' + slow + '">' + formatMs(q.time_ms || 0) + '</td>' +
+        '<td>' + (q.source ? '<span class="source-badge" style="background:' + color + '22;color:' + color + '">' + escHtml(q.source) + '</span>' : '') + '</td></tr>';
+    });
+
+    html += '</tbody></table>';
+    if (sorted.length > 100) {
+      html += '<p style="font-size:0.8rem;color:var(--text-dim);margin-top:0.5rem;">Showing top 100 of ' + sorted.length + ' queries.</p>';
+    }
+    return html;
+  }
+
+  function renderTrace(trace) {
+    let html = '<div class="trace-tree">';
+
+    // Group by phase if available
+    const phases = {};
+    trace.forEach(item => {
+      const phase = item.phase || 'other';
+      if (!phases[phase]) phases[phase] = [];
+      phases[phase].push(item);
+    });
+
+    Object.entries(phases).forEach(([phase, items]) => {
+      const totalPhaseMs = items.reduce((s, i) => s + (i.exclusive_ms || 0), 0);
+      html += '<details class="trace-phase"><summary>' + escHtml(phase) +
+        ' <span style="color:var(--text-dim);font-size:0.8rem">(' + items.length + ' callbacks)</span>' +
+        '<span class="phase-time">' + formatMs(totalPhaseMs) + '</span></summary>';
+      html += '<div class="trace-callbacks">';
+      items.slice(0, 200).forEach(item => {
+        const color = SOURCE_COLORS[item.source_type] || SOURCE_COLORS.unknown;
+        html += '<div class="trace-callback">' +
+          '<span class="cb-source" style="background:' + color + '22;color:' + color + '">' + escHtml(item.source || '') + '</span>' +
+          '<span class="cb-name">' + escHtml(item.callback || '') + '</span>' +
+          '<span class="cb-time">' + formatMs(item.exclusive_ms || 0) + '</span></div>';
+      });
+      if (items.length > 200) {
+        html += '<div style="padding:0.5rem;font-size:0.8rem;color:var(--text-dim)">… and ' + (items.length - 200) + ' more</div>';
+      }
+      html += '</div></details>';
+    });
+
+    html += '</div>';
+    return html;
+  }
+
+  function renderDiagnostics(diag) {
+    let html = '<div class="diagnostics-grid">';
+
+    if (diag.site) {
+      html += '<div class="diag-section"><h3>Environment</h3>';
+      Object.entries(diag.site).forEach(([k, v]) => {
+        html += '<div class="diag-row"><span class="diag-key">' + escHtml(humanize(k)) + '</span>' +
+          '<span class="diag-val">' + escHtml(String(v)) + '</span></div>';
+      });
+      html += '</div>';
+    }
+
+    if (diag.plugins) {
+      html += '<div class="diag-section"><h3>Plugins (' + (diag.plugins.active_count || 0) + ' active)</h3>';
+      (diag.plugins.active || []).forEach(p => {
+        html += '<div class="diag-row"><span class="diag-val">' + escHtml(p) + '</span></div>';
+      });
+      html += '</div>';
+    }
+
+    if (diag.theme) {
+      html += '<div class="diag-section"><h3>Theme</h3>';
+      html += '<div class="diag-row"><span class="diag-key">Active</span><span class="diag-val">' + escHtml(diag.theme.slug || '') + '</span></div>';
+      if (diag.theme.parent) {
+        html += '<div class="diag-row"><span class="diag-key">Parent</span><span class="diag-val">' + escHtml(diag.theme.parent) + '</span></div>';
+      }
+      html += '</div>';
+    }
+
+    if (diag.scale) {
+      html += '<div class="diag-section"><h3>Scale</h3>';
+      Object.entries(diag.scale).forEach(([k, v]) => {
+        html += '<div class="diag-row"><span class="diag-key">' + escHtml(humanize(k)) + '</span>' +
+          '<span class="diag-val">' + escHtml(String(v)) + '</span></div>';
+      });
+      html += '</div>';
+    }
+
+    html += '</div>';
+    return html;
+  }
+
+  function renderHttpCalls(httpCalls) {
+    if (!httpCalls || !httpCalls.length) return '<p style="color:var(--text-muted)">No HTTP calls captured.</p>';
+
+    const sorted = [...httpCalls].sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
+
+    let html = '<table class="data-table">';
+    html += '<thead><tr><th>URL</th><th>Method</th><th>Status</th><th>Source</th><th class="num">Duration</th></tr></thead>';
+    html += '<tbody>';
+    sorted.forEach(h => {
+      const color = SOURCE_COLORS[h.source_type] || SOURCE_COLORS.unknown;
+      const statusClass = h.is_error || (h.status >= 400) ? ' slow' : '';
+      html += '<tr>';
+      html += '<td class="mono" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escHtml(h.url) + '">' + escHtml(h.url) + '</td>';
+      html += '<td>' + escHtml(h.method) + '</td>';
+      html += '<td' + (statusClass ? ' class="' + statusClass + '"' : '') + '>' + (h.status || '—') + '</td>';
+      html += '<td><span class="source-badge" style="background:' + color + '22;color:' + color + '">' + escHtml(h.source_name || 'unknown') + '</span></td>';
+      html += '<td class="num">' + formatMs(h.duration_ms || 0) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table>';
+    return html;
+  }
+
+  function renderAutoloadedOptions(options) {
+    if (!options) return '<p style="color:var(--text-muted)">No autoloaded options data.</p>';
+
+    let html = '';
+    if (options.total_size) {
+      html += '<div class="metrics" style="margin-bottom:1rem"><div class="metric-card"><div class="label">Total Autoload Size</div><div class="value">' + formatBytes(options.total_size) + '</div></div></div>';
+    }
+
+    if (options.items && options.items.length) {
+      const sorted = [...options.items].sort((a, b) => (b.size || 0) - (a.size || 0));
+      html += '<table class="data-table">';
+      html += '<thead><tr><th>Option</th><th>Source</th><th class="num">Size</th></tr></thead>';
+      html += '<tbody>';
+      sorted.forEach(opt => {
+        html += '<tr>';
+        html += '<td class="mono">' + escHtml(opt.name || '') + '</td>';
+        html += '<td>' + escHtml(opt.source || '') + '</td>';
+        html += '<td class="num">' + formatBytes(opt.size || 0) + '</td>';
+        html += '</tr>';
+      });
+      html += '</tbody></table>';
+    }
+
+    return html || '<p style="color:var(--text-muted)">No option details available.</p>';
+  }
+
+  function renderEnqueuedAssets(assets) {
+    if (!assets) return '<p style="color:var(--text-muted)">No enqueued assets data.</p>';
+
+    let html = '';
+    const scripts = assets.scripts || [];
+    const styles = assets.styles || [];
+
+    if (scripts.length) {
+      html += '<h3 style="font-size:0.85rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:0.75rem">Scripts (' + scripts.length + ')</h3>';
+      html += '<table class="data-table">';
+      html += '<thead><tr><th>Handle</th><th>Source</th><th class="num">Size</th></tr></thead>';
+      html += '<tbody>';
+      scripts.forEach(s => {
+        html += '<tr><td class="mono">' + escHtml(s.handle || '') + '</td><td>' + escHtml(s.source || '') + '</td><td class="num">' + formatBytes(s.size || 0) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+
+    if (styles.length) {
+      html += '<h3 style="font-size:0.85rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.04em;margin:1.5rem 0 0.75rem">Styles (' + styles.length + ')</h3>';
+      html += '<table class="data-table">';
+      html += '<thead><tr><th>Handle</th><th>Source</th><th class="num">Size</th></tr></thead>';
+      html += '<tbody>';
+      styles.forEach(s => {
+        html += '<tr><td class="mono">' + escHtml(s.handle || '') + '</td><td>' + escHtml(s.source || '') + '</td><td class="num">' + formatBytes(s.size || 0) + '</td></tr>';
+      });
+      html += '</tbody></table>';
+    }
+
+    return html || '<p style="color:var(--text-muted)">No asset details available.</p>';
+  }
+
+  function formatBytes(bytes) {
+    if (bytes >= 1048576) return (bytes / 1048576).toFixed(1) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  // Utilities
+  function formatMs(ms) {
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+    if (ms >= 10) return ms.toFixed(1) + 'ms';
+    return ms.toFixed(2) + 'ms';
+  }
+
+  function formatDate(iso) {
+    if (!iso) return '—';
+    try {
+      return new Date(iso).toLocaleString();
+    } catch { return iso; }
+  }
+
+  function humanize(str) {
+    return str.replace(/_/g, ' ').replace(/\\b\\w/g, c => c.toUpperCase());
+  }
+
+  function escHtml(str) {
+    const d = document.createElement('div');
+    d.textContent = str;
+    return d.innerHTML;
+  }
+
+  function escAttr(str) {
+    return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  // Go
+  init();
+})();
+</script>
+</body>
+</html>`;
