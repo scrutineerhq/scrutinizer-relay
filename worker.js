@@ -2101,7 +2101,8 @@ body {
         sourcePill = '<span class="asset-source-pill" style="background:' + pillColor + '">' + escHtml(s.attribution.name || s.attribution.slug || '') + '</span>';
       }
       var srcUrl = s.src || '';
-      var srcDisplay = srcUrl.replace(/^https?:\/\/[^\/]+/, '');
+      var srcDisplay = srcUrl;
+      try { srcDisplay = new URL(srcUrl).pathname + new URL(srcUrl).search; } catch(e) {}
       if (srcDisplay.length > 60) srcDisplay = srcDisplay.substring(0, 59) + '\u2026';
       return '<tr><td>' + sourcePill + '<code class="mono">' + escHtml(s.handle || '') + '</code></td>' +
         '<td class="mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escAttr(srcUrl) + '">' + escHtml(srcDisplay) + '</td>' +
