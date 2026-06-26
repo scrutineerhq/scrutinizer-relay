@@ -382,8 +382,9 @@ function handleLanding() {
  * POST /r/ — store encrypted report
  */
 async function handleCreate(request, env) {
-  // Rate limit
-  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  // Rate limit — hash IP for GDPR-compliant storage.
+  const rawIp = request.headers.get('cf-connecting-ip') || 'unknown';
+  const ip = await hashIP(rawIp, env);
   const rateLimited = await checkRateLimit(env, ip, 'create', 10, 60);
   if (rateLimited) {
     return jsonResponse({ error: 'Rate limit exceeded. Try again later.' }, 429);
@@ -455,8 +456,9 @@ async function handleCreate(request, env) {
  * GET /r/{id}/data — return ciphertext for client-side decryption
  */
 async function handleGetData(id, request, env) {
-  // Rate limit reads
-  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  // Rate limit reads — hash IP for GDPR-compliant storage.
+  const rawIp = request.headers.get('cf-connecting-ip') || 'unknown';
+  const ip = await hashIP(rawIp, env);
   const rateLimited = await checkRateLimit(env, ip, 'read', 60, 60);
   if (rateLimited) {
     return jsonResponse({ error: 'Rate limit exceeded. Try again later.' }, 429);
@@ -556,14 +558,37 @@ async function handleView(id, env) {
 /**
  * Rate limiting via Durable Object (sliding window).
  * Falls open on DO errors — relay stays available.
+ *
+ * IPs are HMAC-SHA256 hashed before storage for GDPR compliance.
+ * The hash is consistent per secret, so rate limiting works, but
+ * the raw IP is never persisted in DO storage.
  */
 const RATE_LIMITER_SHARD_COUNT = 16;
 
-function shardKeyFromIP(ip) {
-  // Simple hash: sum char codes, mod shard count
+/**
+ * HMAC-SHA256 hash an IP address for pseudonymous rate limiting.
+ * Returns first 16 hex chars — enough for uniqueness, not reversible.
+ */
+async function hashIP(ip, env) {
+  const secret = (env && env.IP_HASH_SECRET) || 'scrutinizer-relay-default-salt';
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, encoder.encode(ip));
+  const bytes = new Uint8Array(sig);
+  let hex = '';
+  for (let i = 0; i < 8; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+function shardKeyFromIP(hashedIp) {
+  // IP is already HMAC-hashed at this point. Simple char-code hash for shard selection.
   let hash = 0;
-  for (let i = 0; i < ip.length; i++) {
-    hash = ((hash << 5) - hash + ip.charCodeAt(i)) | 0;
+  for (let i = 0; i < hashedIp.length; i++) {
+    hash = ((hash << 5) - hash + hashedIp.charCodeAt(i)) | 0;
   }
   return `shard-${Math.abs(hash) % RATE_LIMITER_SHARD_COUNT}`;
 }
