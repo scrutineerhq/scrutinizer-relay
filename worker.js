@@ -1072,27 +1072,27 @@ body {
 .density-bar.density-slow { background: #d63638; }
 
 /* Memory sparkline */
-.memory-sparkline-wrap {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 6px;
-}
-.memory-sparkline {
-  flex: 1;
-  height: 28px;
-  position: relative;
-}
-.memory-sparkline-svg {
+/* Memory sparkline — overlaid on the timeline bar */
+.memory-overlay-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
   width: 100%;
   height: 100%;
+  pointer-events: none;
+  z-index: 2;
 }
-.memory-sparkline-label {
-  font-size: 0.65rem;
+.memory-overlay-label {
+  position: absolute;
+  right: 4px;
+  top: 2px;
+  font-size: 0.6rem;
   color: #e67e22;
-  white-space: nowrap;
-  flex-shrink: 0;
   font-family: var(--mono);
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 3;
+  text-shadow: 0 0 3px rgba(0,0,0,0.6), 0 0 6px rgba(0,0,0,0.4);
 }
 
 /* Legend */
@@ -1984,6 +1984,39 @@ body {
       var segTitle = escAttr((seg.callback || seg.source || '') + ' \u00b7 ' + formatMs(seg.duration_ms || 0));
       html += '<div class="segment" style="left:' + segPctS.toFixed(3) + '%;width:' + Math.max(segPctW, 0.15).toFixed(3) + '%;background:' + segColor + '" title="' + segTitle + '"></div>';
     }
+
+    // Memory usage sparkline — overlay on the timeline bar.
+    var memPoints = [];
+    for (var mi = 0; mi < timeline.length; mi++) {
+      var memVal = timeline[mi].mem_after || 0;
+      if (memVal > 0) {
+        var memPctX = (timeline[mi].pct_start || 0) + (timeline[mi].pct_width || 0);
+        memPoints.push({ pct: memPctX, mem: memVal });
+      }
+    }
+    if (memPoints.length >= 2) {
+      var memMin = memPoints[0].mem;
+      var memMax = memPoints[0].mem;
+      for (var mm = 1; mm < memPoints.length; mm++) {
+        if (memPoints[mm].mem < memMin) memMin = memPoints[mm].mem;
+        if (memPoints[mm].mem > memMax) memMax = memPoints[mm].mem;
+      }
+      var memRange = memMax - memMin;
+      if (memRange > memMax * 0.01) {
+        var pathD = '';
+        for (var mp = 0; mp < memPoints.length; mp++) {
+          var sx = memPoints[mp].pct;
+          var sy = 100 - ((memPoints[mp].mem - memMin) / memRange) * 80 - 10;
+          pathD += (mp === 0 ? 'M' : 'L') + sx.toFixed(2) + ',' + sy.toFixed(1) + ' ';
+        }
+        var memLabel = formatBytes(memMax) + ' peak';
+        html += '<svg class="memory-overlay-svg" viewBox="0 0 100 100" preserveAspectRatio="none">';
+        html += '<path d="' + pathD + '" fill="none" stroke="rgba(230,126,34,0.7)" stroke-width="2" vector-effect="non-scaling-stroke"/>';
+        html += '</svg>';
+        html += '<span class="memory-overlay-label">' + escHtml(memLabel) + '</span>';
+      }
+    }
+
     html += '</div>';
 
     // Time axis — 5 evenly spaced ticks.
@@ -2105,44 +2138,6 @@ body {
       }
       html += '</div>';
       html += '</div>';
-    }
-
-    // Memory usage sparkline — SVG line synced to the timeline width.
-    var memPoints = [];
-    for (var mi = 0; mi < timeline.length; mi++) {
-      var memVal = timeline[mi].mem_after || 0;
-      if (memVal > 0) {
-        var memPctX = (timeline[mi].pct_start || 0) + (timeline[mi].pct_width || 0);
-        memPoints.push({ pct: memPctX, mem: memVal });
-      }
-    }
-    if (memPoints.length >= 2) {
-      var memMin = memPoints[0].mem;
-      var memMax = memPoints[0].mem;
-      for (var mm = 1; mm < memPoints.length; mm++) {
-        if (memPoints[mm].mem < memMin) memMin = memPoints[mm].mem;
-        if (memPoints[mm].mem > memMax) memMax = memPoints[mm].mem;
-      }
-      var memRange = memMax - memMin;
-      if (memRange > memMax * 0.01) {
-        var svgH = 28;
-        var pathD = '';
-        for (var mp = 0; mp < memPoints.length; mp++) {
-          var sx = memPoints[mp].pct;
-          var sy = svgH - 2 - ((memPoints[mp].mem - memMin) / memRange) * (svgH - 4);
-          pathD += (mp === 0 ? 'M' : 'L') + sx + ',' + sy.toFixed(1) + ' ';
-        }
-        var memLabel = formatBytes(memMax) + ' peak';
-        html += '<div class="memory-sparkline-wrap">';
-        html += '<span class="density-label">Memory</span>';
-        html += '<div class="memory-sparkline">';
-        html += '<svg viewBox="0 0 100 ' + svgH + '" preserveAspectRatio="none" class="memory-sparkline-svg">';
-        html += '<path d="' + pathD + '" fill="none" stroke="#e67e22" stroke-width="1.5" vector-effect="non-scaling-stroke"/>';
-        html += '</svg>';
-        html += '</div>';
-        html += '<span class="memory-sparkline-label">' + escHtml(memLabel) + '</span>';
-        html += '</div>';
-      }
     }
 
     html += '</div>'; // timeline-zoom-wrapper
