@@ -885,6 +885,17 @@ body {
   overflow-y: visible;
   position: relative;
 }
+.rubber-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(21, 183, 164, 0.15);
+  border-left: 2px solid var(--teal);
+  border-right: 2px solid var(--teal);
+  pointer-events: none;
+  z-index: 5;
+  display: none;
+}
 .timeline-zoom-wrapper {
   min-width: 100%;
   position: relative;
@@ -917,6 +928,17 @@ body {
   position: absolute;
   bottom: 0;
   transform: translateX(-50%);
+}
+.milestone.milestone-right .milestone-label {
+  left: auto;
+  right: 50%;
+  transform: none;
+  text-align: right;
+}
+.milestone.milestone-left .milestone-label {
+  left: 50%;
+  transform: none;
+  text-align: left;
 }
 .milestone-stem {
   display: block;
@@ -1866,45 +1888,87 @@ body {
         viewport.scrollLeft = 0;
       });
 
-      // Scroll-to-zoom.
+      // Scroll-to-zoom (no modifier key needed).
       viewport.addEventListener('wheel', function(e) {
-        if (e.ctrlKey || e.metaKey) {
-          e.preventDefault();
-          var rect = viewport.getBoundingClientRect();
-          var mouseX = e.clientX - rect.left + viewport.scrollLeft;
-          var oldZoom = zoom;
-          if (e.deltaY < 0) {
-            zoom = Math.min(zoom * 1.15, maxZoom);
-          } else {
-            zoom = Math.max(zoom / 1.15, 1);
-          }
-          applyZoom();
-          // Keep point under cursor stable.
-          var newScrollLeft = mouseX * (zoom / oldZoom) - (e.clientX - rect.left);
-          viewport.scrollLeft = Math.max(0, newScrollLeft);
+        e.preventDefault();
+        var rect = viewport.getBoundingClientRect();
+        var mouseX = e.clientX - rect.left + viewport.scrollLeft;
+        var oldZoom = zoom;
+        if (e.deltaY < 0) {
+          zoom = Math.min(zoom * 1.3, maxZoom);
+        } else {
+          zoom = Math.max(zoom / 1.3, 1);
         }
+        applyZoom();
+        // Keep point under cursor stable.
+        var newScrollLeft = mouseX * (zoom / oldZoom) - (e.clientX - rect.left);
+        viewport.scrollLeft = Math.max(0, newScrollLeft);
       }, { passive: false });
 
-      // Drag to pan.
+      // Rubber band select (at 1x) or drag to pan (when zoomed).
       var dragging = false;
+      var rubberBanding = false;
       var startX = 0;
       var startScroll = 0;
+      var rubberBandStartX = 0;
+      var rubberBandEl = document.createElement('div');
+      rubberBandEl.className = 'rubber-band';
+      viewport.appendChild(rubberBandEl);
+
       viewport.addEventListener('mousedown', function(e) {
-        if (zoom <= 1) return;
-        dragging = true;
-        startX = e.clientX;
-        startScroll = viewport.scrollLeft;
-        viewport.style.cursor = 'grabbing';
+        if (e.button !== 0) return;
+        if (e.target.classList.contains('timeline-segment')) return;
         e.preventDefault();
+        var rect = viewport.getBoundingClientRect();
+        if (zoom <= 1) {
+          rubberBanding = true;
+          rubberBandStartX = e.clientX - rect.left;
+          rubberBandEl.style.left = rubberBandStartX + 'px';
+          rubberBandEl.style.width = '0px';
+          rubberBandEl.style.display = 'block';
+          viewport.style.cursor = 'col-resize';
+        } else {
+          dragging = true;
+          startX = e.clientX;
+          startScroll = viewport.scrollLeft;
+          viewport.style.cursor = 'grabbing';
+        }
       });
       document.addEventListener('mousemove', function(e) {
+        if (rubberBanding) {
+          var rect = viewport.getBoundingClientRect();
+          var currentX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+          var left = Math.min(rubberBandStartX, currentX);
+          var width = Math.abs(currentX - rubberBandStartX);
+          rubberBandEl.style.left = left + 'px';
+          rubberBandEl.style.width = width + 'px';
+          return;
+        }
         if (!dragging) return;
         viewport.scrollLeft = startScroll - (e.clientX - startX);
       });
-      document.addEventListener('mouseup', function() {
-        if (!dragging) return;
-        dragging = false;
-        viewport.style.cursor = '';
+      document.addEventListener('mouseup', function(e) {
+        if (rubberBanding) {
+          rubberBanding = false;
+          rubberBandEl.style.display = 'none';
+          viewport.style.cursor = '';
+          var rect = viewport.getBoundingClientRect();
+          var endX = Math.max(0, Math.min(e.clientX - rect.left, rect.width));
+          var left = Math.min(rubberBandStartX, endX);
+          var width = Math.abs(endX - rubberBandStartX);
+          if (width < 10) return;
+          var viewportW = rect.width;
+          var selStartPct = left / viewportW;
+          var selWidthPct = width / viewportW;
+          zoom = Math.min(1 / selWidthPct, maxZoom);
+          applyZoom();
+          viewport.scrollLeft = selStartPct * viewportW * zoom;
+          return;
+        }
+        if (dragging) {
+          dragging = false;
+          viewport.style.cursor = '';
+        }
       });
     })();
   }
@@ -1934,7 +1998,7 @@ body {
     html += '<span class="timeline-zoom-level">1&times;</span>';
     html += '<button type="button" class="zoom-in-btn" title="Zoom in">+</button>';
     html += '<button type="button" style="width:auto;padding:0 10px" class="zoom-reset-btn" title="Reset zoom">Reset</button>';
-    html += '<span class="timeline-zoom-hint">Scroll to zoom &middot; Drag to pan</span>';
+    html += '<span class="timeline-zoom-hint">Drag to select &middot; Scroll to zoom</span>';
     html += '</div>';
 
     // Scrollable viewport.
@@ -1973,7 +2037,14 @@ body {
       for (var lk = 0; lk < labelPositions.length; lk++) {
         var stemHeight = (labelTiers[lk] + 1) * tierPx + baseOffset;
         var leftPct = labelPositions[lk].pct.toFixed(2);
-        html += '<div class="milestone" style="left:' + leftPct + '%;height:' + stemHeight + 'px">';
+        var pctVal = labelPositions[lk].pct;
+        var edgeCls = '';
+        if (pctVal > 85) {
+          edgeCls = ' milestone-right';
+        } else if (pctVal < 15) {
+          edgeCls = ' milestone-left';
+        }
+        html += '<div class="milestone' + edgeCls + '" style="left:' + leftPct + '%;height:' + stemHeight + 'px">';
         html += '<span class="milestone-label">' + escHtml(labelPositions[lk].name) + '</span>';
         html += '<span class="milestone-dot"></span>';
         html += '<span class="milestone-stem"></span>';
