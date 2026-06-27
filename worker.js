@@ -117,6 +117,13 @@ export default {
         return withSecurityHeaders(await handleGetData(dataMatch[1], request, env));
       }
 
+      // POST /r/{id}/confirm-read — burn-after-read deletion, called by the
+      // viewer only after it has successfully decrypted (D27).
+      const confirmMatch = path.match(/^\/r\/([a-f0-9]{32})\/confirm-read$/);
+      if (confirmMatch && request.method === 'POST') {
+        return withSecurityHeaders(await handleConfirmRead(confirmMatch[1], env));
+      }
+
       // DELETE /r/{id} — revoke report
       const deleteMatch = path.match(/^\/r\/([a-f0-9]{32})$/);
       if (deleteMatch && request.method === 'DELETE') {
@@ -531,6 +538,7 @@ async function handleGetData(id, request, env) {
     iv: meta.iv,
     has_passphrase: meta.has_passphrase === 'true' || meta.has_passphrase === true,
     compressed: meta.compressed === 'true' || meta.compressed === true,
+    expire_after_reading: meta.expire_after_reading === 'true' || meta.expire_after_reading === true,
     created_at: meta.created_at,
     expires_at: meta.expires_at,
   };
@@ -541,15 +549,33 @@ async function handleGetData(id, request, env) {
     response.kdf_iterations = parseInt(meta.kdf_iterations, 10) || 600000;
   }
 
-  // Expire after reading — delete after serving
-  if (meta.expire_after_reading === 'true' || meta.expire_after_reading === true) {
-    await env.REPORTS.delete(`report:${id}`);
-  }
+  // D27: do NOT delete on read. A GET only fetches the ciphertext; the viewer
+  // calls POST /confirm-read after it has successfully decrypted. This means a
+  // transient network/decrypt error no longer destroys the only copy, and an
+  // unauthenticated GET can't silently burn someone else's report.
 
   return jsonResponse(response, 200, {
     'Cache-Control': 'no-store',
     'Referrer-Policy': 'no-referrer',
   });
+}
+
+/**
+ * POST /r/{id}/confirm-read — delete a burn-after-read report after the viewer
+ * confirms a successful decrypt. No-op (still 200) for reports that aren't
+ * marked expire_after_reading, so the viewer can call it unconditionally.
+ */
+async function handleConfirmRead(id, env) {
+  const obj = await env.REPORTS.head(`report:${id}`);
+  if (!obj) {
+    return jsonResponse({ success: true, deleted: false }, 200);
+  }
+  const meta = obj.customMetadata || {};
+  if (meta.expire_after_reading === 'true' || meta.expire_after_reading === true) {
+    await env.REPORTS.delete(`report:${id}`);
+    return jsonResponse({ success: true, deleted: true }, 200);
+  }
+  return jsonResponse({ success: true, deleted: false }, 200);
 }
 
 /**
@@ -1734,6 +1760,7 @@ body {
       showLoading('Decrypting report…');
       const report = await decryptReport(data.ciphertext, data.iv, fragment, null, data.compressed);
       renderReport(report, data);
+      confirmReadIfNeeded(data);
 
     } catch (err) {
       console.error('Init error:', err);
@@ -1939,6 +1966,7 @@ body {
         showLoading('Decrypting…');
         const report = await decryptReport(data.ciphertext, data.iv, fragment, passphrase, data.compressed, { salt: data.kdf_salt, iterations: data.kdf_iterations });
         renderReport(report, data);
+        confirmReadIfNeeded(data);
       } catch {
         showPassphrasePrompt(data, fragment);
         document.getElementById('passphrase-error').textContent = 'Incorrect passphrase. Please try again.';
@@ -1947,6 +1975,16 @@ body {
   }
 
   // Render the full report
+  // D27: tell the relay to delete a burn-after-read report, but only after a
+  // successful decrypt+render. Fire-and-forget and best-effort — the report is
+  // already shown, and the relay no-ops for non-burn reports.
+  function confirmReadIfNeeded(meta) {
+    if (VIEWER_MODE !== 'relay' || !meta || !meta.expire_after_reading) {
+      return;
+    }
+    fetch('/r/' + REPORT_ID + '/confirm-read', { method: 'POST' }).catch(() => {});
+  }
+
   function renderReport(report, meta) {
     // Reset per-source color assignments for this report.
     pluginColorMap = {};
