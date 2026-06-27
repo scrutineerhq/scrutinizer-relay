@@ -1616,6 +1616,18 @@ body {
     fetch('/r/' + REPORT_ID + '/confirm-read', { method: 'POST' }).catch(() => {});
   }
 
+  // The profiler emits durations in nanoseconds (*_ns); this viewer renders
+  // milliseconds (*_ms). Backfill the _ms fields from _ns when absent so the
+  // breakdown bar, sources table, and trace times render. Recurses into trace
+  // children. Idempotent (skips fields that already have an _ms value).
+  function backfillMs(arr) {
+    (arr || []).forEach(function (o) {
+      if (o && o.exclusive_ms == null && o.exclusive_ns != null) o.exclusive_ms = o.exclusive_ns / 1e6;
+      if (o && o.inclusive_ms == null && o.inclusive_ns != null) o.inclusive_ms = o.inclusive_ns / 1e6;
+      if (o && o.children) backfillMs(o.children);
+    });
+  }
+
   function renderReport(report, meta) {
     // Reset per-source color assignments for this report.
     pluginColorMap = {};
@@ -1650,6 +1662,8 @@ body {
     const milestones = report.phase_markers || [];
     const diagnostics = report.diagnostics || null;
     const trace = report.trace || [];
+    backfillMs(sources);
+    backfillMs(trace);
     const httpCalls = report.http_calls || [];
     const autoloadedOptions = report.autoloaded_options || null;
     const enqueuedAssets = report.enqueued_assets || null;

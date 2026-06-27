@@ -148,4 +148,25 @@ test.describe('viewer XSS hardening', () => {
     expect(await page.evaluate(() => !!window.ScrutinizerTimeline)).toBe(true);
     expect(errs, 'no JS errors while rendering the timeline').toEqual([]);
   });
+
+  test('breakdown bar renders from nanosecond-only source data', async ({ page }) => {
+    // Real compiled profiles carry only *_ns (the viewer renders *_ms). This
+    // guards the regression where the breakdown bar rendered empty/black.
+    const report = {
+      captured_at: '2026-01-01T00:00:00Z',
+      summary: { duration_ns: 50000000, source_count: 2 },
+      request: { method: 'GET', route_key: '/', status: 200 },
+      sources: [
+        { source: 'plugin-a', name: 'Plugin A', type: 'plugin', exclusive_ns: 40000000, inclusive_ns: 45000000, call_count: 3 },
+        { source: 'wordpress', name: 'WordPress Core', type: 'core', exclusive_ns: 10000000, inclusive_ns: 12000000, call_count: 5 },
+      ],
+      timeline: [], phase_markers: [], queries: [], http_calls: [], trace: [],
+    };
+    await loadReport(page, report);
+    await page.getByRole('button', { name: 'Breakdown', exact: true }).first().click()
+      .catch(() => page.locator('text=Breakdown').first().click());
+    await page.waitForTimeout(500);
+    const segs = await page.locator('#panel-breakdown .breakdown-segment').count();
+    expect(segs, 'breakdown segments must render from _ns-only data').toBeGreaterThan(0);
+  });
 });
