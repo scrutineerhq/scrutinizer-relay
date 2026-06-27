@@ -1948,7 +1948,7 @@ body {
     if (request.role) html += '<div class="meta-item"><strong>Role:</strong> ' + escHtml(request.role) + '</div>';
     if (request.status) html += '<div class="meta-item"><strong>Status:</strong> ' + escHtml(String(request.status)) + '</div>';
     if (report.captured_at) html += '<div class="meta-item"><strong>Captured:</strong> ' + escHtml(formatDate(report.captured_at)) + '</div>';
-    html += '<div class="meta-item" style="color:var(--text-dim)">Expires: ' + escHtml(formatDate(meta.expires_at)) + '</div>';
+    if (meta.expires_at) html += '<div class="meta-item" style="color:var(--text-dim)">Expires: ' + escHtml(formatDate(meta.expires_at)) + '</div>';
     html += '</div>';
 
     // Metric cards
