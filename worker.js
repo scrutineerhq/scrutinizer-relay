@@ -1665,7 +1665,7 @@ body {
     const autoloadedOptions = report.autoloaded_options || null;
     const enqueuedAssets = report.enqueued_assets || null;
 
-    const durationMs = (summary.duration_ns || 0) / 1e6;
+    const durationMs = summary.duration_ms || (summary.duration_ns || 0) / 1e6;
     const memoryMb = (summary.memory_peak || 0) / (1024 * 1024);
     const queryCount = summary.query_count || 0;
     const callbackCount = summary.callback_count || 0;
@@ -2130,13 +2130,32 @@ body {
   function renderTrace(trace) {
     let html = '<div class="trace-tree">';
 
-    // Group by the WordPress hook, parsed out of the composite id. Stash the
-    // display callback (spl_object_id "#123" hashes stripped) on each item.
+    // Group by the WordPress hook. Two data shapes arrive here:
+    //   Raw (plugin):  { id: "callback@hook:pri", exclusive_ns, inclusive_ns }
+    //   Share payload:  { callback, phase, source, exclusive_ms, inclusive_ms }
+    // Handle both so the contract never silently breaks again.
     const phases = Object.create(null);
     trace.forEach(item => {
-      const parsed = parseTraceId(item.id);
-      item.__cb = parsed.callback.replace(/#\\d+/g, '');
-      const phase = parsed.hook || 'other';
+      let cb, hook;
+      if (item.id) {
+        // Raw format — parse composite id
+        const parsed = parseTraceId(item.id);
+        cb = parsed.callback;
+        hook = parsed.hook;
+      } else {
+        // Share format — fields already split
+        cb = item.callback || '';
+        hook = item.phase || '';
+      }
+      // Normalize _ns → _ms if needed (raw format uses _ns)
+      if (item.exclusive_ns != null && item.exclusive_ms == null) {
+        item.exclusive_ms = item.exclusive_ns / 1e6;
+      }
+      if (item.inclusive_ns != null && item.inclusive_ms == null) {
+        item.inclusive_ms = item.inclusive_ns / 1e6;
+      }
+      item.__cb = cb.replace(/#\d+/g, '');
+      const phase = hook || 'other';
       if (!phases[phase]) phases[phase] = [];
       phases[phase].push(item);
     });
@@ -2148,7 +2167,7 @@ body {
         '<span class="phase-time">' + formatMs(totalPhaseMs) + '</span></summary>';
       html += '<div class="trace-callbacks">';
       items.slice(0, 200).forEach(item => {
-        const name = item.__cb || item.id || '';
+        const name = item.__cb || item.callback || item.id || '';
         html += '<div class="trace-callback">' +
           '<span class="cb-name">' + escHtml(name) + '</span>' +
           '<span class="cb-time">' + formatMs(item.exclusive_ms || 0) + '</span></div>';
