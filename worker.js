@@ -2269,7 +2269,7 @@ body {
     const sorted = [...httpCalls].sort((a, b) => (b.duration_ms || 0) - (a.duration_ms || 0));
 
     let html = '<table class="data-table">';
-    html += '<thead><tr><th>URL</th><th>Method</th><th>Status</th><th>Source</th><th class="num">Duration</th></tr></thead>';
+    html += '<thead><tr><th>URL</th><th>Method</th><th>Mode</th><th>Status</th><th>Source</th><th class="num">Duration</th></tr></thead>';
     html += '<tbody>';
     sorted.forEach(h => {
       const color = SOURCE_COLORS[h.source_type] || SOURCE_COLORS.unknown;
@@ -2277,6 +2277,8 @@ body {
       html += '<tr>';
       html += '<td class="mono" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escAttr(String(h.url || '')) + '">' + escHtml(String(h.url || '')) + '</td>';
       html += '<td>' + escHtml(h.method) + '</td>';
+      // Fire-and-forget (blocking:false) calls don't make PHP wait.
+      html += '<td>' + (h.blocking === false ? '<span style="color:var(--text-muted)">async</span>' : 'blocking') + '</td>';
       html += '<td' + (statusClass ? ' class="' + statusClass + '"' : '') + '>' + escHtml(String(h.status || '—')) + '</td>';
       html += '<td><span class="source-badge" style="background:' + color + '22;color:' + color + '">' + escHtml(h.source_name || 'unknown') + '</span></td>';
       html += '<td class="num">' + formatMs(h.duration_ms || 0) + '</td>';
