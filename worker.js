@@ -56,6 +56,11 @@ export default {
         ));
       }
 
+      // Usage dashboard — admin-only, Basic auth with ADMIN_KEY secret
+      if (path === '/usage' && request.method === 'GET') {
+        return withSecurityHeaders(await handleUsage(request, env));
+      }
+
       // Landing page
       if (path === '/' || path === '') {
         return withSecurityHeaders(handleLanding());
@@ -294,6 +299,171 @@ export class RateLimiterDO {
       this.state.storage.delete(storageDeletes);
     }
   }
+}
+
+/**
+ * GET /usage — Admin-only usage dashboard
+ *
+ * Basic auth with ADMIN_KEY. Enumerates R2 to show live report stats.
+ * Same design DNA as the .lol family usage pages.
+ */
+async function handleUsage(request, env) {
+  // Basic auth check
+  const authErr = checkAdminAuth(request, env.ADMIN_KEY);
+  if (authErr) return authErr;
+
+  const now = new Date();
+  let cursor = undefined;
+  let totalReports = 0;
+  let totalBytes = 0;
+  let activeReports = 0;
+  let expiredReports = 0;
+  let permanentReports = 0;
+  let passphraseReports = 0;
+  let burnAfterReadReports = 0;
+  let compressedReports = 0;
+  let oldestCreated = null;
+  let newestCreated = null;
+  const byDay = {};
+
+  do {
+    const listed = await env.REPORTS.list({ prefix: 'report:', limit: 500, cursor });
+    for (const obj of listed.objects) {
+      totalReports++;
+      totalBytes += obj.size || 0;
+      const meta = obj.customMetadata || {};
+
+      if (meta.expires_at) {
+        if (new Date(meta.expires_at) > now) {
+          activeReports++;
+        } else {
+          expiredReports++;
+        }
+      } else {
+        permanentReports++;
+        activeReports++;
+      }
+
+      if (meta.has_passphrase === 'true' || meta.has_passphrase === true) passphraseReports++;
+      if (meta.expire_after_reading === 'true' || meta.expire_after_reading === true) burnAfterReadReports++;
+      if (meta.compressed === 'true' || meta.compressed === true) compressedReports++;
+
+      if (meta.created_at) {
+        const d = new Date(meta.created_at);
+        if (!oldestCreated || d < oldestCreated) oldestCreated = d;
+        if (!newestCreated || d > newestCreated) newestCreated = d;
+        const day = meta.created_at.slice(0, 10);
+        byDay[day] = (byDay[day] || 0) + 1;
+      }
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  // Format helpers
+  const fmt = (v) => (v ?? 0).toLocaleString();
+  const fmtBytes = (b) => {
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1024 / 1024).toFixed(2) + ' MB';
+  };
+
+  // Last 14 days
+  const recentDays = [];
+  for (let i = 13; i >= 0; i--) {
+    const d = new Date(now);
+    d.setUTCDate(d.getUTCDate() - i);
+    const key = d.toISOString().slice(0, 10);
+    recentDays.push({ day: key, count: byDay[key] || 0 });
+  }
+
+  const lastActivity = newestCreated ? newestCreated.toISOString().replace('T', ' ').slice(0, 19) + ' UTC' : 'none';
+
+  const html = `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Usage &#8212; scrutinizer.dev</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0f;color:#d8d8e0;font-family:'Inter',system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.page{max-width:720px;margin:0 auto;padding:2rem 1.5rem}
+h1{font-size:1.5rem;font-weight:800;letter-spacing:-0.03em;margin-bottom:0.5rem}
+h1 .t{color:#15B7A4}
+.sub{color:#5c5c6b;font-size:12px;font-family:'JetBrains Mono',monospace;margin-bottom:2rem}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:2rem}
+.card{background:#111116;border:1px solid #1c1c24;border-radius:8px;padding:14px 16px}
+.card .label{font-size:10px;text-transform:uppercase;letter-spacing:0.1em;color:#5c5c6b;font-family:'JetBrains Mono',monospace;margin-bottom:4px}
+.card .val{font-size:24px;font-weight:800;color:#15B7A4;font-family:'JetBrains Mono',monospace}
+.card .val.warn{color:#F0A94E}.card .val.err{color:#f87171}.card .val.inf{color:#38d9a9}
+.section{margin-top:1.75rem}
+.sec-label{font-size:10px;text-transform:uppercase;letter-spacing:0.12em;color:#5c5c6b;font-family:'JetBrains Mono',monospace;font-weight:600;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #1c1c24}
+.r{display:flex;font-size:12px;line-height:2;font-family:'JetBrains Mono',monospace}
+.r .k{color:#5c5c6b;width:155px;flex-shrink:0}
+.r .v{color:#d8d8e0}
+</style></head><body>
+<div class="page">
+<h1>scrutinizer<span class="t">.dev</span> usage</h1>
+<div class="sub">last share: ${lastActivity}</div>
+
+<div class="cards">
+  <div class="card"><div class="label">Reports Stored</div><div class="val">${fmt(totalReports)}</div></div>
+  <div class="card"><div class="label">Active</div><div class="val inf">${fmt(activeReports)}</div></div>
+  <div class="card"><div class="label">Expired</div><div class="val warn">${fmt(expiredReports)}</div></div>
+  <div class="card"><div class="label">Permanent</div><div class="val">${fmt(permanentReports)}</div></div>
+  <div class="card"><div class="label">Storage</div><div class="val">${fmtBytes(totalBytes)}</div></div>
+  <div class="card"><div class="label">Avg Size</div><div class="val">${totalReports > 0 ? fmtBytes(Math.round(totalBytes / totalReports)) : '0 B'}</div></div>
+</div>
+
+<div class="section">
+  <div class="sec-label">Report Features</div>
+  <div class="r"><span class="k">Passphrase protected</span><span class="v">${fmt(passphraseReports)}</span></div>
+  <div class="r"><span class="k">Burn after read</span><span class="v">${fmt(burnAfterReadReports)}</span></div>
+  <div class="r"><span class="k">Compressed</span><span class="v">${fmt(compressedReports)}</span></div>
+</div>
+
+<div class="section">
+  <div class="sec-label">Shares Per Day (14d)</div>
+  ${recentDays.map(d => `<div class="r"><span class="k">${d.day}</span><span class="v">${d.count}</span></div>`).join('')}
+</div>
+
+</div></body></html>`;
+
+  return new Response(html, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'private, no-store' },
+  });
+}
+
+/**
+ * Check admin Basic auth against ADMIN_KEY.
+ */
+function checkAdminAuth(request, adminKey) {
+  if (!adminKey) {
+    return jsonResponse({ error: 'Admin key not configured' }, 503);
+  }
+  const authHeader = request.headers.get('Authorization') || '';
+  if (!authHeader.startsWith('Basic ')) {
+    return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Basic realm="Scrutinizer Admin"' },
+    });
+  }
+  let pass;
+  try {
+    const decoded = atob(authHeader.slice(6));
+    [, pass] = decoded.split(':');
+  } catch {
+    return new Response(JSON.stringify({ error: 'Malformed credentials' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Basic realm="Scrutinizer Admin"' },
+    });
+  }
+  if (!pass || !timingSafeEqual(pass, adminKey)) {
+    return new Response(JSON.stringify({ error: 'Invalid credentials' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json', 'WWW-Authenticate': 'Basic realm="Scrutinizer Admin"' },
+    });
+  }
+  return null;
 }
 
 /**
