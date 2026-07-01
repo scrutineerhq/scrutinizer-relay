@@ -1933,7 +1933,7 @@ body {
       html += '<div class="tab-panel' + (tabs[0]?.id === 'breakdown' ? ' active' : '') + '" id="panel-breakdown">';
       html += '<p style="font-size:0.85rem;color:var(--text-muted);margin-bottom:1rem;">Where server request duration is spent, broken down by source.</p>';
       html += renderBreakdownBar(sources, durationMs);
-      html += renderLegend(sources);
+      html += renderLegend(sources, durationMs);
       html += '</div>';
     }
 
@@ -2124,25 +2124,40 @@ body {
     var sorted = [...sources].sort(function(a, b) { return (b.exclusive_ms || 0) - (a.exclusive_ms || 0); });
 
     var html = '<div class="breakdown-bar">';
+    var renderedPct = 0;
     sorted.forEach(function(src) {
-      var pct = ((src.exclusive_ms || 0) / totalMs * 100).toFixed(2);
-      if (parseFloat(pct) < 0.1) return;
+      var pct = ((src.exclusive_ms || 0) / totalMs * 100);
+      if (pct < 0.1) return;
+      renderedPct += pct;
       var color = getSourceColor(src.source || src.name || '', src.type || 'unknown');
-      html += '<div class="breakdown-segment" style="width:' + pct + '%;background:' + color + '">' +
-        '<div class="tooltip">' + escHtml(src.source || src.name) + ': ' + formatMs(src.exclusive_ms || 0) + ' (' + pct + '%)</div></div>';
+      html += '<div class="breakdown-segment" style="width:' + pct.toFixed(2) + '%;background:' + color + '">' +
+        '<div class="tooltip">' + escHtml(src.source || src.name) + ': ' + formatMs(src.exclusive_ms || 0) + ' (' + pct.toFixed(1) + '%)</div></div>';
     });
+    var unattribPct = 100 - renderedPct;
+    if (unattribPct >= 0.1) {
+      var unattribMs = totalMs * unattribPct / 100;
+      html += '<div class="breakdown-segment" style="width:' + unattribPct.toFixed(2) + '%;background:' + (SOURCE_COLORS.unattributed || '#475569') + '">' +
+        '<div class="tooltip">Unattributed: ' + formatMs(unattribMs) + ' (' + unattribPct.toFixed(1) + '%)</div></div>';
+    }
     html += '</div>';
     return html;
   }
 
-  function renderLegend(sources) {
+  function renderLegend(sources, totalMs) {
     var sorted = [...sources].sort(function(a, b) { return (b.exclusive_ms || 0) - (a.exclusive_ms || 0); });
     var html = '<div class="legend">';
+    var renderedPct = 0;
     sorted.forEach(function(src) {
+      var pct = totalMs ? ((src.exclusive_ms || 0) / totalMs * 100) : 0;
+      renderedPct += pct;
       var color = getSourceColor(src.source || src.name || '', src.type || 'unknown');
       html += '<div class="legend-item"><div class="legend-swatch" style="background:' + color + '"></div>' +
         escHtml(src.source || src.name) + '</div>';
     });
+    var unattribPct = 100 - renderedPct;
+    if (totalMs && unattribPct >= 0.1) {
+      html += '<div class="legend-item"><div class="legend-swatch" style="background:' + (SOURCE_COLORS.unattributed || '#475569') + '"></div>Unattributed</div>';
+    }
     html += '</div>';
     return html;
   }
