@@ -99,23 +99,6 @@ export default {
         return withSecurityHeaders(await handleDelete(deleteMatch[1], request, env));
       }
 
-      // PUT /r/{id} — admin-only ciphertext replacement (temporary)
-      const putMatch = path.match(/^\/r\/([a-f0-9]{32})$/);
-      if (putMatch && request.method === 'PUT') {
-        const authResult = checkAdminAuth(request, env.ADMIN_KEY);
-        if (authResult) return withSecurityHeaders(authResult);
-        const id = putMatch[1];
-        const obj = await env.REPORTS.get(`report:${id}`);
-        if (!obj) return withSecurityHeaders(jsonResponse({ error: 'Not found' }, 404));
-        const body = await request.json();
-        if (!body.ciphertext) return withSecurityHeaders(jsonResponse({ error: 'Missing ciphertext' }, 400));
-        // Preserve all existing metadata, just replace the body
-        await env.REPORTS.put(`report:${id}`, body.ciphertext, {
-          customMetadata: obj.customMetadata,
-        });
-        return withSecurityHeaders(jsonResponse({ ok: true, id }));
-      }
-
       // GET /r/{id} — serve SPA viewer
       const viewMatch = path.match(/^\/r\/([a-f0-9]{32})$/);
       if (viewMatch && request.method === 'GET') {
